@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminalpet"
+version = "0.2.0"
+description = "A tiny virtual pet that lives in your terminal with animations, dynamic roaming, and leveling."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Teja Priyan", email = "teja1616150@gmail.com" }]
+
+[project.urls]
+Homepage = "https://github.com/TejaPriyan/TerminalPet"
+Repository = "https://github.com/TejaPriyan/TerminalPet"
+Issues = "https://github.com/TejaPriyan/TerminalPet/issues"
+
+[project.scripts]
+pet = "terminalpet.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
