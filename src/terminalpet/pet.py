@@ -1,8 +1,13 @@
 """Core state, decay, and actions for a terminalpet."""
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
+import os
 import random
+import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,44 +36,7 @@ SPECIES_FLAVOR = {
     "robot": {"noun": "robot", "sound": "beeps", "affection": "whirs contentedly"},
 }
 
-ART = {
-    "dead": r"""
-      x   x
-       \_/
-      ( R.I.P )
-     '--------'
-""",
-    "starving": r"""
-     (>_<)
-    <|  |>
-      |  |
-""",
-    "sad": r"""
-     (;_;)
-    <|  |>
-      |  |
-""",
-    "tired": r"""
-     (-_-)zzZ
-    <|  |>
-      |  |
-""",
-    "content": r"""
-     (^_^)
-    <|  |>
-      |  |
-""",
-    "happy": r"""
-     (^o^)
-    <\  />
-      |  |
-""",
-    "ecstatic": r"""
-   \(^o^)/
-    <\  />
-      |  |
-""",
-}
+DEFAULT_FLAVOR = {"noun": "pet", "sound": "chirps", "affection": "nuzzles your hand"}
 
 
 def clamp(value: float) -> float:
@@ -95,20 +63,62 @@ class Pet:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Pet":
-        import dataclasses
+        if not isinstance(data, dict):
+            raise ValueError("Pet state must be a JSON object")
         valid_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in valid_fields}
+
+        for req in ("name", "species", "birth_time", "last_update"):
+            if req not in filtered:
+                raise TypeError(f"Missing required field: {req}")
+
+        if not isinstance(filtered["name"], str) or not isinstance(filtered["species"], str):
+            raise TypeError("Pet name and species must be strings")
+
+        for num_field in ("birth_time", "last_update", "hunger", "happiness", "energy", "starving_since"):
+            if num_field in filtered:
+                raw = filtered[num_field]
+                if isinstance(raw, bool):
+                    raise TypeError(f"Field '{num_field}' must be numeric")
+                val = float(raw)
+                if not math.isfinite(val):
+                    raise ValueError(f"Field '{num_field}' must be finite")
+                filtered[num_field] = val
+
+        for stat_field in ("hunger", "happiness", "energy"):
+            if stat_field in filtered:
+                filtered[stat_field] = clamp(filtered[stat_field])
+
+        for int_field, min_val in (("level", 1), ("xp", 0)):
+            if int_field in filtered:
+                raw = filtered[int_field]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    raise TypeError(f"Field '{int_field}' must be an integer")
+                if not math.isfinite(raw):
+                    raise ValueError(f"Field '{int_field}' must be finite")
+                filtered[int_field] = max(min_val, int(raw))
+
+        if "alive" in filtered and not isinstance(filtered["alive"], bool):
+            raise TypeError("Field 'alive' must be a boolean")
+
+        if "death_reason" in filtered and not isinstance(filtered["death_reason"], str):
+            filtered["death_reason"] = str(filtered["death_reason"])
+
         return cls(**filtered)
 
     def add_xp(self, amount: int) -> bool:
-        """Add XP and return True if leveled up."""
+        """Add XP and return True if at least one level was gained."""
+        if amount <= 0:
+            return False
+        if self.level < 1:
+            self.level = 1
         self.xp += amount
-        needed = self.level * 100
-        if self.xp >= needed:
-            self.xp -= needed
+        leveled = False
+        while self.xp >= self.level * 100:
+            self.xp -= self.level * 100
             self.level += 1
-            return True
-        return False
+            leveled = True
+        return leveled
 
 
 def new_pet(name: str, species: str | None = None) -> Pet:
@@ -118,17 +128,65 @@ def new_pet(name: str, species: str | None = None) -> Pet:
     return Pet(name=name, species=species, birth_time=now, last_update=now)
 
 
+def _backup_corrupt_state() -> Path | None:
+    timestamp = int(time.time())
+    backup = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt.{timestamp}")
+    counter = 1
+    while backup.exists():
+        backup = STATE_FILE.with_name(f"{STATE_FILE.name}.corrupt.{timestamp}.{counter}")
+        counter += 1
+    try:
+        STATE_FILE.replace(backup)
+        return backup
+    except OSError:
+        return None
+
+
 def load() -> Pet | None:
     if not STATE_FILE.exists():
         return None
-    with open(STATE_FILE) as f:
-        return Pet.from_dict(json.load(f))
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return Pet.from_dict(data)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        backup = _backup_corrupt_state()
+        if backup is not None:
+            print(
+                f"Warning: Could not read pet state ({exc}). "
+                f"Backed up corrupt file to {backup}.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Warning: Could not read pet state ({exc}). Starting fresh.",
+                file=sys.stderr,
+            )
+        return None
 
 
 def save(pet: Pet) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(pet.to_dict(), f, indent=2)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=STATE_FILE.parent,
+            prefix=f".{STATE_FILE.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(pet.to_dict(), f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def reset() -> None:
@@ -171,7 +229,7 @@ def feed(pet: Pet) -> str:
     pet.happiness = clamp(pet.happiness + 5)
     pet.energy = clamp(pet.energy + 2)
     leveled = pet.add_xp(15)
-    flavor = SPECIES_FLAVOR[pet.species]
+    flavor = SPECIES_FLAVOR.get(pet.species, DEFAULT_FLAVOR)
     msg = f"{pet.name} {flavor['sound']} and devours the food. Much better. (+15 XP)"
     if leveled:
         msg += f"\n  ✨ 🎉 LEVEL UP! {pet.name} is now Level {pet.level}! 🎉 ✨"
@@ -187,7 +245,7 @@ def play(pet: Pet) -> str:
     pet.energy = clamp(pet.energy - 15)
     pet.hunger = clamp(pet.hunger + 10)
     leveled = pet.add_xp(25)
-    flavor = SPECIES_FLAVOR[pet.species]
+    flavor = SPECIES_FLAVOR.get(pet.species, DEFAULT_FLAVOR)
     msg = f"{pet.name} {flavor['affection']} and plays with you. So much fun! (+25 XP)"
     if leveled:
         msg += f"\n  ✨ 🎉 LEVEL UP! {pet.name} is now Level {pet.level}! 🎉 ✨"
@@ -224,7 +282,7 @@ def mood(pet: Pet) -> str:
 
 def age_str(pet: Pet) -> str:
     end = pet.last_update if not pet.alive else time.time()
-    seconds = end - pet.birth_time
+    seconds = max(0.0, end - pet.birth_time)
     days = int(seconds // 86400)
     hours = int((seconds % 86400) // 3600)
     if days == 0 and hours == 0:

@@ -1,9 +1,11 @@
 """Animations, ASCII art, and ANSI color styling for terminalpet."""
 from __future__ import annotations
 
-import os
+import random
+import re
 import sys
 import time
+import unicodedata
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -37,8 +39,23 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-if os.name == "nt":
-    os.system("")
+def enable_windows_ansi() -> None:
+    """Enable ANSI/VT escape sequences on Windows consoles without spawning a shell."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        enable_vt = 0x0004
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            if handle and handle != -1:
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    kernel32.SetConsoleMode(handle, mode.value | enable_vt)
+    except Exception:
+        pass
 
 
 def hide_cursor() -> None:
@@ -306,7 +323,13 @@ def get_art(species: str, mood_name: str) -> str:
     return art_map.get(mood_name, art_map.get("content", ""))
 
 
-def color_bar(value: float, width: int = 20, is_hunger: bool = False) -> str:
+def color_bar(
+    value: float,
+    width: int = 20,
+    is_hunger: bool = False,
+    show_status: bool = True,
+) -> str:
+    width = max(1, width)
     clamped = max(0.0, min(100.0, value))
     filled = int(round((clamped / 100.0) * width))
     empty = width - filled
@@ -335,21 +358,9 @@ def color_bar(value: float, width: int = 20, is_hunger: bool = False) -> str:
             status_text = colored("Critical!", RED)
 
     bar_str = f"{bar_color}{'█' * filled}{DIM}{'░' * empty}{RESET}"
+    if not show_status:
+        return f"[{bar_str}] {int(clamped):>3}/100"
     return f"[{bar_str}] {int(clamped):>3}/100  {status_text}"
-
-
-def play_frames(frames: list[str], delay: float = 0.22) -> None:
-    hide_cursor()
-    try:
-        for i, frame in enumerate(frames):
-            # Clear previous frame or print frame
-            sys.stdout.write("\r" + frame)
-            sys.stdout.flush()
-            time.sleep(delay)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-    finally:
-        show_cursor()
 
 
 def animate_hatch(name: str, species: str) -> None:
@@ -362,10 +373,28 @@ def animate_hatch(name: str, species: str) -> None:
         f"\n  {YELLOW}✨ \\( ^o^ )/ ✨{RESET}\n  {GREEN}{BOLD}{name} the {species} has hatched into the world!{RESET}\n",
     ]
     print(colored(">>> Hatching in progress...", CYAN))
-    for frame in frames:
-        sys.stdout.write("\r\033[K" + frame)
+    is_tty = sys.stdout.isatty() if hasattr(sys.stdout, "isatty") else False
+    if not is_tty:
+        sys.stdout.write(frames[-1])
         sys.stdout.flush()
-        time.sleep(0.35)
+        return
+
+    hide_cursor()
+    try:
+        prev_lines = 0
+        for i, frame in enumerate(frames):
+            frame_lines = frame.rstrip("\n").split("\n")
+            if i > 0 and prev_lines > 0:
+                sys.stdout.write(f"\033[{prev_lines}A\r")
+            for line in frame_lines:
+                sys.stdout.write(f"\r{line}\033[K\n")
+            if prev_lines > len(frame_lines):
+                sys.stdout.write("\033[J")
+            sys.stdout.flush()
+            prev_lines = len(frame_lines)
+            time.sleep(0.35)
+    finally:
+        show_cursor()
 
 
 def animate_feed(pet_name: str, species: str) -> None:
@@ -383,11 +412,16 @@ def animate_feed(pet_name: str, species: str) -> None:
         sys.stdout.flush()
         return
 
-    for frame in frames:
-        sys.stdout.write(f"\r\033[K{CYAN}{frame}{RESET}")
+    hide_cursor()
+    try:
+        for frame in frames:
+            sys.stdout.write(f"\r\033[K{CYAN}{frame}{RESET}")
+            sys.stdout.flush()
+            time.sleep(0.3)
+        sys.stdout.write("\n")
         sys.stdout.flush()
-        time.sleep(0.3)
-    sys.stdout.write("\n")
+    finally:
+        show_cursor()
 
 
 def animate_play(pet_name: str, species: str) -> None:
@@ -405,11 +439,16 @@ def animate_play(pet_name: str, species: str) -> None:
         sys.stdout.flush()
         return
 
-    for frame in frames:
-        sys.stdout.write(f"\r\033[K{MAGENTA}{frame}{RESET}")
+    hide_cursor()
+    try:
+        for frame in frames:
+            sys.stdout.write(f"\r\033[K{MAGENTA}{frame}{RESET}")
+            sys.stdout.flush()
+            time.sleep(0.3)
+        sys.stdout.write("\n")
         sys.stdout.flush()
-        time.sleep(0.3)
-    sys.stdout.write("\n")
+    finally:
+        show_cursor()
 
 
 def animate_nap(pet_name: str) -> None:
@@ -426,15 +465,17 @@ def animate_nap(pet_name: str) -> None:
         sys.stdout.flush()
         return
 
-    for frame in frames:
-        sys.stdout.write(f"\r\033[K{BLUE}{frame}{RESET}")
+    hide_cursor()
+    try:
+        for frame in frames:
+            sys.stdout.write(f"\r\033[K{BLUE}{frame}{RESET}")
+            sys.stdout.flush()
+            time.sleep(0.35)
+        sys.stdout.write("\n")
         sys.stdout.flush()
-        time.sleep(0.35)
-    sys.stdout.write("\n")
+    finally:
+        show_cursor()
 
-
-import re
-import random
 
 ANSI_REGEX = re.compile(r"\033\[[0-9;]*[a-zA-Z]")
 
@@ -444,8 +485,120 @@ def strip_ansi(text: str) -> str:
     return ANSI_REGEX.sub("", text)
 
 
+def _char_display_width(ch: str) -> int:
+    cat = unicodedata.category(ch)
+    if cat in ("Mn", "Me", "Cf", "Cc", "Cs"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _can_emoji_upgrade(ch: str) -> bool:
+    cp = ord(ch)
+    return unicodedata.category(ch) == "So" or 0x2600 <= cp <= 0x27BF or cp >= 0x1F000
+
+
+def _iter_plain_clusters(segment: str) -> list[tuple[str, int]]:
+    """Group a plain-text segment into (cluster_str, display_width) tuples."""
+    clusters: list[tuple[str, int]] = []
+    cur_chars: list[str] = []
+    cur_width = 0
+    last_base = ""
+    prev_was_zwj = False
+
+    for ch in segment:
+        if ch == "\u200d":
+            if cur_chars:
+                cur_chars.append(ch)
+            prev_was_zwj = True
+            continue
+        if ch == "\ufe0f":
+            if cur_chars:
+                cur_chars.append(ch)
+                if cur_width == 1 and last_base and _can_emoji_upgrade(last_base):
+                    cur_width = 2
+            continue
+        if ch == "\ufe0e":
+            if cur_chars:
+                cur_chars.append(ch)
+            continue
+
+        w = _char_display_width(ch)
+        if w == 0:
+            if cur_chars:
+                cur_chars.append(ch)
+            continue
+
+        if prev_was_zwj and cur_chars and _can_emoji_upgrade(ch):
+            cur_chars.append(ch)
+            prev_was_zwj = False
+            continue
+
+        prev_was_zwj = False
+        if cur_chars:
+            clusters.append(("".join(cur_chars), cur_width))
+        cur_chars = [ch]
+        cur_width = w
+        last_base = ch
+
+    if cur_chars:
+        clusters.append(("".join(cur_chars), cur_width))
+    return clusters
+
+
 def visible_len(text: str) -> int:
-    return len(strip_ansi(text))
+    """Calculate terminal column width of text (ANSI-free, handling wide/emoji chars)."""
+    plain = strip_ansi(text)
+    return sum(w for _, w in _iter_plain_clusters(plain))
+
+
+def truncate_visible(text: str, max_width: int, ellipsis: str = "…") -> str:
+    """Truncate text to at most max_width terminal columns without breaking ANSI or clusters."""
+    if max_width <= 0:
+        return ""
+    if visible_len(text) <= max_width:
+        return text
+
+    ell_width = visible_len(ellipsis)
+    if max_width < ell_width:
+        ellipsis = ""
+        ell_width = 0
+    budget = max_width - ell_width
+
+    out: list[str] = []
+    used = 0
+    has_open_ansi = False
+    pos = 0
+    stopped = False
+
+    def _consume_plain(segment: str) -> None:
+        nonlocal used, stopped
+        for cluster, w in _iter_plain_clusters(segment):
+            if used + w > budget:
+                stopped = True
+                return
+            out.append(cluster)
+            used += w
+
+    for match in ANSI_REGEX.finditer(text):
+        if match.start() > pos:
+            _consume_plain(text[pos:match.start()])
+            if stopped:
+                break
+        seq = match.group(0)
+        out.append(seq)
+        has_open_ansi = seq != RESET
+        pos = match.end()
+
+    if not stopped and pos < len(text):
+        _consume_plain(text[pos:])
+
+    if ellipsis:
+        out.append(ellipsis)
+    if has_open_ansi:
+        out.append(RESET)
+    return "".join(out)
 
 
 # Roaming and active sprites for each species
@@ -784,6 +937,10 @@ ROAMING_ART: dict[str, dict[str, list[list[str]]]] = {
 
 
 def get_roam_sprite(species: str, state_name: str, frame_idx: int) -> list[str]:
+    if state_name == "dead":
+        art = get_art(species, "dead").strip("\n")
+        lines = art.splitlines()
+        return lines if lines else ["  ( x _ x )"]
     species_data = ROAMING_ART.get(species, ROAMING_ART["dragon"])
     frames = species_data.get(state_name, species_data.get("walk_right", []))
     if not frames:
@@ -835,51 +992,68 @@ def render_room_box(
     room_width: int = 68,
 ) -> str:
     """Render the pet playground box with roaming pet at horizontal offset."""
+    room_width = max(4, room_width)
     inner_width = room_width - 2
     border_top = f"{CYAN}┌{'─' * inner_width}┐{RESET}"
     border_mid = f"{CYAN}├{'─' * inner_width}┤{RESET}"
     border_bot = f"{CYAN}└{'─' * inner_width}┘{RESET}"
 
-    # Header line
-    xp_needed = level * 100
-    header_str = f" {BOLD}{pet_name}{RESET} the {species}  |  {GREEN}Level {level}{RESET} (XP: {xp}/{xp_needed})  |  Feeling: {BOLD}{mood_name}{RESET}"
-    header_pad = inner_width - visible_len(header_str)
-    header_line = f"{CYAN}│{RESET}{header_str}{' ' * max(0, header_pad)}{CYAN}│{RESET}"
+    def _box_line(content: str) -> str:
+        clean = content.replace("\r", "").replace("\n", " ")
+        fitted = truncate_visible(clean, inner_width)
+        pad = max(0, inner_width - visible_len(fitted))
+        return f"{CYAN}│{RESET}{fitted}{' ' * pad}{CYAN}│{RESET}"
 
-    # Stat bar line (compact)
-    h_bar = f"{color_bar(hunger, width=8, is_hunger=True)}"
-    hap_bar = f"{color_bar(happiness, width=8, is_hunger=False)}"
-    stats_str = f" Hunger: {h_bar}  Happy: {hap_bar}"
-    stats_pad = inner_width - visible_len(stats_str)
-    stats_line = f"{CYAN}│{RESET}{stats_str}{' ' * max(0, stats_pad)}{CYAN}│{RESET}"
+    # Header line
+    xp_needed = max(1, level) * 100
+    header_str = (
+        f" {BOLD}{pet_name}{RESET} the {species}  |  "
+        f"{GREEN}Level {level}{RESET} (XP: {xp}/{xp_needed})  |  "
+        f"Feeling: {BOLD}{mood_name}{RESET}"
+    )
+    header_line = _box_line(header_str)
+
+    # Stat bar line (compact so all 3 stats fit cleanly inside standard box widths)
+    bar_width = 6 if inner_width >= 76 else 4
+    h_bar = color_bar(hunger, width=bar_width, is_hunger=True, show_status=False)
+    hap_bar = color_bar(happiness, width=bar_width, is_hunger=False, show_status=False)
+    eng_bar = color_bar(energy, width=bar_width, is_hunger=False, show_status=False)
+    stats_str = f" Hunger:{h_bar} Happy:{hap_bar} Energy:{eng_bar}"
+    stats_line = _box_line(stats_str)
 
     # Room sky / field
-    room_lines = []
-    room_lines.append(f"{CYAN}│{RESET}{' ' * inner_width}{CYAN}│{RESET}")
+    room_lines = [f"{CYAN}│{RESET}{' ' * inner_width}{CYAN}│{RESET}"]
 
-    # Render pet sprite lines with offset
+    # Render pet sprite lines with offset, clamping and truncating if needed
     for raw_line in sprite_lines:
-        v_len = visible_len(raw_line)
-        clamped_offset = max(1, min(offset, inner_width - v_len - 1))
+        clean_line = raw_line.replace("\r", "").replace("\n", " ")
+        v_len = visible_len(clean_line)
+        if v_len >= inner_width - 1:
+            clamped_offset = 0 if v_len >= inner_width else 1
+            fitted_sprite = truncate_visible(clean_line, inner_width - clamped_offset)
+        else:
+            clamped_offset = max(1, min(offset, inner_width - v_len - 1))
+            fitted_sprite = clean_line
         pad_left = " " * clamped_offset
-        pad_right = " " * max(0, inner_width - clamped_offset - v_len)
-        room_lines.append(f"{CYAN}│{RESET}{pad_left}{raw_line}{pad_right}{CYAN}│{RESET}")
+        pad_right = " " * max(0, inner_width - clamped_offset - visible_len(fitted_sprite))
+        room_lines.append(f"{CYAN}│{RESET}{pad_left}{fitted_sprite}{pad_right}{CYAN}│{RESET}")
 
     # Ground terrain line
     terrain_pattern = "^ . ~ ~ . ^ ~ ~ ~ . ^ ~ ~ . ^ ~ ~ . ^ ~ ~ . ^ ~ ~ . ^ ~ ~ . ^ ~ ~ . ^ ~ ~ . ^ "
-    terrain = terrain_pattern[:inner_width]
+    repeats = (inner_width // len(terrain_pattern)) + 1
+    terrain = (terrain_pattern * repeats)[:inner_width]
     ground_line = f"{CYAN}│{DIM}{GREEN}{terrain}{RESET}{CYAN}│{RESET}"
     room_lines.append(ground_line)
 
     # Activity message line
-    act_str = f" {activity_msg}"
-    act_pad = inner_width - visible_len(act_str)
-    act_line = f"{CYAN}│{RESET}{act_str}{' ' * max(0, act_pad)}{CYAN}│{RESET}"
+    act_line = _box_line(f" {activity_msg}")
 
     # Controls line
-    ctrl_str = f" {BOLD}Controls:{RESET}  [{GREEN}F{RESET}]eed  [{MAGENTA}P{RESET}]lay  [{BLUE}N{RESET}]ap  [{YELLOW}C{RESET}]orner Sit  [{CYAN}R{RESET}]oam  [{WHITE}Q{RESET}]uit"
-    ctrl_pad = inner_width - visible_len(ctrl_str)
-    ctrl_line = f"{CYAN}│{RESET}{ctrl_str}{' ' * max(0, ctrl_pad)}{CYAN}│{RESET}"
+    ctrl_str = (
+        f" {BOLD}Controls:{RESET}  [{GREEN}F{RESET}]eed  [{MAGENTA}P{RESET}]lay  "
+        f"[{BLUE}N{RESET}]ap  [{YELLOW}C{RESET}]orner Sit  [{CYAN}R{RESET}]oam  [{WHITE}Q{RESET}]uit"
+    )
+    ctrl_line = _box_line(ctrl_str)
 
     output = [
         border_top,

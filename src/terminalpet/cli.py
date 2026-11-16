@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import os
+import random
+import shutil
 import sys
 import time
+from typing import Iterator
 
 from . import anim
 from . import pet as petmod
@@ -36,7 +41,10 @@ def _print_status(pet: petmod.Pet, elapsed_hours: float = 0.0) -> None:
     print(anim.colored(narrative, anim.CYAN))
     xp_needed = pet.level * 100
     xp_percent = int((pet.xp / xp_needed) * 100) if xp_needed > 0 else 0
-    print(f"{anim.BOLD}{pet.name}{anim.RESET} the {pet.species} — {anim.CYAN}{petmod.age_str(pet)}{anim.RESET} — feeling {anim.BOLD}{m}{anim.RESET}")
+    print(
+        f"{anim.BOLD}{pet.name}{anim.RESET} the {pet.species} — "
+        f"{anim.CYAN}{petmod.age_str(pet)}{anim.RESET} — feeling {anim.BOLD}{m}{anim.RESET}"
+    )
     print(f"  {anim.BOLD}Level {pet.level}{anim.RESET} [XP: {pet.xp}/{xp_needed} ({xp_percent}%)]")
     print(f"  hunger    {petmod.bar(pet.hunger, is_hunger=True)}")
     print(f"  happiness {petmod.bar(pet.happiness)}")
@@ -140,11 +148,124 @@ def cmd_reset(args: argparse.Namespace) -> None:
     print("Done. Run `pet adopt <name>` whenever you're ready for a new one.")
 
 
+@contextmanager
+def _posix_cbreak_mode() -> Iterator[None]:
+    """Put POSIX stdin in cbreak mode for single-keypress input if stdin is a TTY."""
+    if sys.platform == "win32":
+        yield
+        return
+    if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
+        yield
+        return
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+    except (ImportError, OSError, ValueError):
+        yield
+        return
+
+    try:
+        tty.setcbreak(fd)
+        yield
+    except (OSError, ValueError, termios.error):
+        yield
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except (OSError, ValueError, termios.error):
+            pass
+
+
+def _poll_key_win32(timeout: float) -> str | None:
+    import msvcrt
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b"\x00", b"\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                return None
+            try:
+                return ch.decode("utf-8").lower()
+            except UnicodeDecodeError:
+                return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.04, remaining))
+
+
+def _poll_key_posix(timeout: float) -> str | None:
+    import select
+
+    if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
+        time.sleep(timeout)
+        return None
+    try:
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], timeout)
+    except (OSError, ValueError):
+        time.sleep(timeout)
+        return None
+    if not ready:
+        return None
+    try:
+        ch = os.read(fd, 1)
+    except OSError:
+        return None
+    if not ch:
+        return None
+    if ch == b"\x1b":
+        try:
+            while select.select([fd], [], [], 0)[0]:
+                os.read(fd, 1)
+        except OSError:
+            pass
+        return None
+    try:
+        return ch.decode("utf-8").lower()
+    except UnicodeDecodeError:
+        return None
+
+
+def _poll_key(timeout: float = 0.35) -> str | None:
+    """Non-blocking single-key poll with timeout across Windows and POSIX."""
+    if sys.platform == "win32":
+        return _poll_key_win32(timeout)
+    return _poll_key_posix(timeout)
+
+
+def _pet_watch_snapshot(pet: petmod.Pet) -> tuple:
+    """Comparable snapshot of persisted pet fields to avoid redundant disk writes."""
+    return (
+        pet.name,
+        pet.species,
+        round(pet.hunger, 1),
+        round(pet.happiness, 1),
+        round(pet.energy, 1),
+        pet.alive,
+        pet.death_reason,
+        pet.starving_since > 0.0,
+        pet.level,
+        pet.xp,
+    )
+
+
+def _format_action_msg(icon: str, msg: str, pet_name: str, level: int, xp_gain: int) -> str:
+    lines = msg.splitlines()
+    first_line = lines[0] if lines else ""
+    if len(lines) > 1 and "LEVEL UP!" in msg:
+        return f"🎉  LEVEL UP! {pet_name} is now Level {level}! (+{xp_gain} XP)"
+    return f"{icon}  {first_line}"
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     """Live interactive Tamagotchi dashboard mode with roaming & corner sitting."""
-    import random
-    import shutil
-
     pet = _load_or_prompt()
     if pet is None:
         return
@@ -152,152 +273,219 @@ def cmd_watch(args: argparse.Namespace) -> None:
     cols, _ = shutil.get_terminal_size((80, 24))
     room_width = max(52, min(74, cols - 4))
     inner_width = room_width - 2
-    max_offset = inner_width - 18
+    max_offset = max(2, inner_width - 18)
     min_offset = 2
 
     print(anim.colored("Starting live playground... Press 'q' or Ctrl+C to quit.", anim.CYAN))
     time.sleep(0.5)
 
+    last_saved = _pet_watch_snapshot(pet)
+    if pet.alive:
+        pet, _ = petmod.tick(pet)
+        snap = _pet_watch_snapshot(pet)
+        if snap != last_saved:
+            petmod.save(pet)
+            last_saved = snap
+
     offset = max(2, (max_offset + min_offset) // 2)
     direction = 1
-    state = "roam"
+    state = "roam" if pet.alive else "dead"
     state_timer = 0
     frame_idx = 0
-    activity_msg = f"{pet.name} is happily roaming around the terminal!"
+    msg_hold_ticks = 0
+    if pet.alive:
+        activity_msg = f"{pet.name} is happily roaming around the terminal!"
+    else:
+        cause = pet.death_reason or "passed away"
+        activity_msg = f"💀  {pet.name} has {cause}. Run `pet reset` to start fresh."
 
     try:
         anim.hide_cursor()
-        while True:
-            # Tick decay
-            pet, _ = petmod.tick(pet)
-            petmod.save(pet)
+        with _posix_cbreak_mode():
+            while True:
+                if pet.alive:
+                    pet, _ = petmod.tick(pet)
+                    snap = _pet_watch_snapshot(pet)
+                    if snap != last_saved:
+                        petmod.save(pet)
+                        last_saved = snap
 
-            m = petmod.mood(pet)
-            frame_idx += 1
-            state_timer += 1
+                m = petmod.mood(pet)
+                hold_msg = msg_hold_ticks > 0
+                if hold_msg:
+                    msg_hold_ticks -= 1
 
-            # State machine for roaming and sitting in corner
-            if state == "roam":
-                sprite_name = "walk_right" if direction == 1 else "walk_left"
-                offset += direction
-                if offset >= max_offset:
-                    offset = max_offset
-                    # Hit right wall: 60% chance to sit in corner, 40% turn around
-                    if random.random() < 0.6:
-                        state = "corner_sit"
-                        state_timer = 0
-                        activity_msg = f"🛋️  {pet.name} reached the right corner and curled up to sit."
-                    else:
-                        direction = -1
-                        activity_msg = f"🐾  {pet.name} turned around and trotted left."
-                elif offset <= min_offset:
-                    offset = min_offset
-                    if random.random() < 0.6:
-                        state = "corner_sit"
-                        state_timer = 0
-                        activity_msg = f"🛋️  {pet.name} found the left corner and sat down comfortably."
-                    else:
-                        direction = 1
-                        activity_msg = f"🐾  {pet.name} turned around and trotted right."
+                if not pet.alive:
+                    state = "dead"
+                    sprite_name = "dead"
+                    if not hold_msg:
+                        cause = pet.death_reason or "passed away"
+                        activity_msg = f"💀  {pet.name} has {cause}. Run `pet reset` to start fresh."
                 else:
-                    activity_msg = f"🐾  {pet.name} is roaming across the terminal... (Press [C] for corner)"
+                    frame_idx += 1
+                    state_timer += 1
 
-            elif state == "corner_sit":
-                sprite_name = "corner_sit"
-                activity_msg = f"🛋️  {pet.name} is resting cozily in the corner. (Press [R] to roam)"
-                if state_timer >= 12:  # After ~4 seconds
-                    state = "roam"
-                    direction = 1 if offset <= min_offset else -1
-                    state_timer = 0
-                    activity_msg = f"🐾  {pet.name} hopped up from the corner and started roaming!"
+                    # State machine for roaming and sitting in corner
+                    if state == "roam":
+                        sprite_name = "walk_right" if direction == 1 else "walk_left"
+                        offset += direction
+                        if offset >= max_offset:
+                            offset = max_offset
+                            # Hit right wall: 60% chance to sit in corner, 40% turn around
+                            if random.random() < 0.6:
+                                state = "corner_sit"
+                                state_timer = 0
+                                if not hold_msg:
+                                    activity_msg = (
+                                        f"🛋️  {pet.name} reached the right corner and curled up to sit."
+                                    )
+                            else:
+                                direction = -1
+                                if not hold_msg:
+                                    activity_msg = f"🐾  {pet.name} turned around and trotted left."
+                        elif offset <= min_offset:
+                            offset = min_offset
+                            if random.random() < 0.6:
+                                state = "corner_sit"
+                                state_timer = 0
+                                if not hold_msg:
+                                    activity_msg = (
+                                        f"🛋️  {pet.name} found the left corner and sat down comfortably."
+                                    )
+                            else:
+                                direction = 1
+                                if not hold_msg:
+                                    activity_msg = f"🐾  {pet.name} turned around and trotted right."
+                        else:
+                            if not hold_msg:
+                                activity_msg = (
+                                    f"🐾  {pet.name} is roaming across the terminal... (Press [C] for corner)"
+                                )
 
-            elif state == "dance":
-                sprite_name = "dance"
-                if state_timer >= 5:
-                    state = "roam"
-                    state_timer = 0
-                    activity_msg = f"🐾  {pet.name} finished playing and resumed walking around."
+                    elif state == "corner_sit":
+                        sprite_name = "corner_sit"
+                        if not hold_msg:
+                            activity_msg = (
+                                f"🛋️  {pet.name} is resting cozily in the corner. (Press [R] to roam)"
+                            )
+                        if state_timer >= 12:  # After ~4 seconds
+                            state = "roam"
+                            direction = 1 if offset <= min_offset else -1
+                            state_timer = 0
+                            if not hold_msg:
+                                activity_msg = (
+                                    f"🐾  {pet.name} hopped up from the corner and started roaming!"
+                                )
 
-            # Fetch sprite
-            sprite_lines = anim.get_roam_sprite(pet.species, sprite_name, frame_idx)
+                    elif state == "dance":
+                        sprite_name = "dance"
+                        if state_timer >= 5:
+                            state = "roam"
+                            state_timer = 0
+                            if not hold_msg:
+                                activity_msg = (
+                                    f"🐾  {pet.name} finished playing and resumed walking around."
+                                )
+                    else:
+                        sprite_name = "walk_right"
 
-            # Render room box
-            box_text = anim.render_room_box(
-                pet_name=pet.name,
-                species=pet.species,
-                level=pet.level,
-                xp=pet.xp,
-                mood_name=m,
-                hunger=pet.hunger,
-                happiness=pet.happiness,
-                energy=pet.energy,
-                sprite_lines=sprite_lines,
-                offset=offset,
-                activity_msg=activity_msg,
-                room_width=room_width,
-            )
+                sprite_lines = anim.get_roam_sprite(pet.species, sprite_name, frame_idx)
 
-            sys.stdout.write("\033[2J\033[H")
-            sys.stdout.write(box_text + "\n")
-            sys.stdout.flush()
+                box_text = anim.render_room_box(
+                    pet_name=pet.name,
+                    species=pet.species,
+                    level=pet.level,
+                    xp=pet.xp,
+                    mood_name=m,
+                    hunger=pet.hunger,
+                    happiness=pet.happiness,
+                    energy=pet.energy,
+                    sprite_lines=sprite_lines,
+                    offset=offset,
+                    activity_msg=activity_msg,
+                    room_width=room_width,
+                )
 
-            # Non-blocking key check
-            key_pressed = None
-            if sys.platform == "win32":
-                import msvcrt
-                start = time.time()
-                while time.time() - start < 0.35:
-                    if msvcrt.kbhit():
-                        ch = msvcrt.getch()
-                        try:
-                            key_pressed = ch.decode("utf-8").lower()
-                        except UnicodeDecodeError:
-                            pass
-                        break
-                    time.sleep(0.04)
-            else:
-                time.sleep(0.35)
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.write(box_text + "\n")
+                sys.stdout.flush()
 
-            if key_pressed == "q":
-                break
-            elif key_pressed == "f":
-                _ = petmod.feed(pet)
-                petmod.save(pet)
-                state = "dance"
-                state_timer = 0
-                activity_msg = f"🍴  {pet.name} chowed down the treat! (+15 XP)"
-            elif key_pressed == "p":
-                if pet.energy < 15:
-                    activity_msg = f"😴  {pet.name} is too tired to play right now. Let it nap first!"
-                else:
-                    _ = petmod.play(pet)
-                    petmod.save(pet)
+                key_pressed = _poll_key(0.35)
+
+                if key_pressed == "q":
+                    break
+                elif not pet.alive:
+                    if key_pressed == "f":
+                        activity_msg = f"💀  {petmod.feed(pet)}"
+                        msg_hold_ticks = 6
+                    elif key_pressed == "p":
+                        activity_msg = f"💀  {petmod.play(pet)}"
+                        msg_hold_ticks = 6
+                    elif key_pressed == "n":
+                        activity_msg = f"💀  {petmod.nap(pet)}"
+                        msg_hold_ticks = 6
+                    elif key_pressed in ("c", "r"):
+                        activity_msg = (
+                            f"💀  {pet.name} is gone. Press [Q] to quit or run `pet reset`."
+                        )
+                        msg_hold_ticks = 6
+                elif key_pressed == "f":
+                    msg = petmod.feed(pet)
+                    snap = _pet_watch_snapshot(pet)
+                    if snap != last_saved:
+                        petmod.save(pet)
+                        last_saved = snap
                     state = "dance"
                     state_timer = 0
-                    activity_msg = f"🎾  {pet.name} caught the toy and danced with joy! (+25 XP)"
-            elif key_pressed == "n":
-                _ = petmod.nap(pet)
-                petmod.save(pet)
-                state = "corner_sit"
-                state_timer = 0
-                offset = max_offset if direction == 1 else min_offset
-                activity_msg = f"💤  {pet.name} curled up in the corner for a restoring nap! (+10 XP)"
-            elif key_pressed == "c":
-                state = "corner_sit"
-                state_timer = 0
-                offset = max_offset if direction == 1 else min_offset
-                activity_msg = f"🛋️  {pet.name} went to sit comfortably in the corner."
-            elif key_pressed == "r":
-                state = "roam"
-                state_timer = 0
-                direction = 1 if offset <= min_offset else -1
-                activity_msg = f"🐾  {pet.name} jumped up to roam around!"
+                    activity_msg = _format_action_msg("🍴", msg, pet.name, pet.level, 15)
+                    msg_hold_ticks = 6
+                elif key_pressed == "p":
+                    was_tired = pet.energy < 15
+                    msg = petmod.play(pet)
+                    if was_tired:
+                        activity_msg = f"😴  {msg.splitlines()[0]}"
+                        msg_hold_ticks = 6
+                    else:
+                        snap = _pet_watch_snapshot(pet)
+                        if snap != last_saved:
+                            petmod.save(pet)
+                            last_saved = snap
+                        state = "dance"
+                        state_timer = 0
+                        activity_msg = _format_action_msg("🎾", msg, pet.name, pet.level, 25)
+                        msg_hold_ticks = 6
+                elif key_pressed == "n":
+                    msg = petmod.nap(pet)
+                    snap = _pet_watch_snapshot(pet)
+                    if snap != last_saved:
+                        petmod.save(pet)
+                        last_saved = snap
+                    state = "corner_sit"
+                    state_timer = 0
+                    offset = max_offset if direction == 1 else min_offset
+                    activity_msg = _format_action_msg("💤", msg, pet.name, pet.level, 10)
+                    msg_hold_ticks = 6
+                elif key_pressed == "c":
+                    state = "corner_sit"
+                    state_timer = 0
+                    offset = max_offset if direction == 1 else min_offset
+                    activity_msg = f"🛋️  {pet.name} went to sit comfortably in the corner."
+                    msg_hold_ticks = 6
+                elif key_pressed == "r":
+                    state = "roam"
+                    state_timer = 0
+                    direction = 1 if offset <= min_offset else -1
+                    activity_msg = f"🐾  {pet.name} jumped up to roam around!"
+                    msg_hold_ticks = 6
 
     except KeyboardInterrupt:
         pass
     finally:
         anim.show_cursor()
-        print("\nExited playground mode. Your pet is resting safely!")
+        if pet.alive:
+            print("\nExited playground mode. Your pet is resting safely!")
+        else:
+            print("\nExited playground mode. Run `pet reset` when you're ready to adopt a new one.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -340,6 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    anim.enable_windows_ansi()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):

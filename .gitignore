@@ -28,11 +28,20 @@ env/
 venv/
 ENV/
 
+# Testing / caches / Node artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+node_modules/
+
 # IDE / Editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# Terminalpet state (don't commit personal pet state if any local files)
+# Guard against accidentally committing local state exports (runtime state lives in ~/.terminalpet/pet.json)
 pet.json
+*.tmp
